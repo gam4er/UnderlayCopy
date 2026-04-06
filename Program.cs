@@ -55,7 +55,18 @@ switch (options.Mode)
         }
     case CopyMode.Metadata:
         {
-            var extents = FsutilParser.GetFileExtents(options.SourceFile);
+            IReadOnlyList<FileExtent> extents;
+            if (options.MetadataWinApi)
+            {
+                Console.WriteLine("Metadata extent backend: WinAPI (FSCTL_GET_RETRIEVAL_POINTERS)");
+                extents = NtfsNative.GetFileExtentsByRetrievalPointers(options.SourceFile);
+            }
+            else
+            {
+                Console.WriteLine("Metadata extent backend: fsutil file queryextents");
+                extents = FsutilParser.GetFileExtents(options.SourceFile);
+            }
+
             Console.WriteLine($"Found {extents.Count} extent(s)");
             foreach (var extent in extents)
             {
@@ -83,7 +94,7 @@ internal enum CopyMode
     Metadata
 }
 
-internal sealed record CliOptions(CopyMode Mode, string SourceFile, string DestinationFile, string VolumePath)
+internal sealed record CliOptions(CopyMode Mode, string SourceFile, string DestinationFile, string VolumePath, bool MetadataWinApi)
 {
     public static CliOptions? Parse(string[] args)
     {
@@ -96,6 +107,7 @@ internal sealed record CliOptions(CopyMode Mode, string SourceFile, string Desti
         string? source = null;
         string? destination = null;
         string volume = @"\\.\C:";
+        var metadataWinApi = false;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -112,6 +124,9 @@ internal sealed record CliOptions(CopyMode Mode, string SourceFile, string Desti
                     break;
                 case "--volume":
                     volume = ReadValue(args, ref i);
+                    break;
+                case "--metadata-winapi":
+                    metadataWinApi = ReadBoolValue(args, ref i);
                     break;
                 default:
                     throw new ArgumentException($"Unknown argument: {args[i]}");
@@ -130,13 +145,13 @@ internal sealed record CliOptions(CopyMode Mode, string SourceFile, string Desti
             throw new ArgumentException("Mode must be either MFT or Metadata.");
         }
 
-        return new CliOptions(mode, source, destination, volume);
+        return new CliOptions(mode, source, destination, volume, metadataWinApi);
     }
 
     public static void PrintUsage()
     {
         Console.WriteLine("Usage:");
-        Console.WriteLine("  UnderlayCopy --mode <MFT|Metadata> --source <path> --destination <path> [--volume \\\\.\\C:]");
+        Console.WriteLine(@"  UnderlayCopy --mode <MFT|Metadata> --source <path> --destination <path> [--volume \\.\C:] [--metadata-winapi <true|false>]");
     }
 
     private static string ReadValue(string[] args, ref int index)
@@ -148,6 +163,22 @@ internal sealed record CliOptions(CopyMode Mode, string SourceFile, string Desti
 
         index++;
         return args[index];
+    }
+
+    private static bool ReadBoolValue(string[] args, ref int index)
+    {
+        if (index + 1 >= args.Length || args[index + 1].StartsWith("--", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        index++;
+        if (!bool.TryParse(args[index], out var result))
+        {
+            throw new ArgumentException($"Value for argument --metadata-winapi must be true or false.");
+        }
+
+        return result;
     }
 }
 
@@ -190,7 +221,7 @@ internal static class FsutilParser
             var clustersHex = segments.SkipWhile(s => 
                 !(
                     s.Equals("Clusters:", StringComparison.OrdinalIgnoreCase) || 
-                    s.Equals("Êëàñòåðû:", StringComparison.OrdinalIgnoreCase)
+                    s.Equals("ÃŠÃ«Ã Ã±Ã²Ã¥Ã°Ã»:", StringComparison.OrdinalIgnoreCase)
                 )
             ).Skip(1).FirstOrDefault();
             var lcnHex = segments.SkipWhile(s => !s.Equals("LCN:", StringComparison.OrdinalIgnoreCase)).Skip(1).FirstOrDefault();
@@ -368,28 +399,41 @@ internal static class NtfsReader
                 break;
             }
 
-            var startOffset = extent.Lcn * clusterSize;
-            device.Seek(startOffset, SeekOrigin.Begin);
-
             long copied = 0;
-            while (copied < toCopy)
+            if (extent.Lcn == -1)
             {
-                var readSize = (int)Math.Min(buffer.Length, toCopy - copied);
-                var read = 0;
-
-                while (read < readSize)
+                while (copied < toCopy)
                 {
-                    var chunk = device.Read(buffer, read, readSize - read);
-                    if (chunk <= 0)
+                    var writeSize = (int)Math.Min(buffer.Length, toCopy - copied);
+                    Array.Clear(buffer, 0, writeSize);
+                    output.Write(buffer, 0, writeSize);
+                    copied += writeSize;
+                }
+            }
+            else
+            {
+                var startOffset = extent.Lcn * clusterSize;
+                device.Seek(startOffset, SeekOrigin.Begin);
+
+                while (copied < toCopy)
+                {
+                    var readSize = (int)Math.Min(buffer.Length, toCopy - copied);
+                    var read = 0;
+
+                    while (read < readSize)
                     {
-                        throw new EndOfStreamException("Unexpected end of device read");
+                        var chunk = device.Read(buffer, read, readSize - read);
+                        if (chunk <= 0)
+                        {
+                            throw new EndOfStreamException("Unexpected end of device read");
+                        }
+
+                        read += chunk;
                     }
 
-                    read += chunk;
+                    output.Write(buffer, 0, read);
+                    copied += read;
                 }
-
-                output.Write(buffer, 0, read);
-                copied += read;
             }
 
             bytesRemaining -= copied;
@@ -497,6 +541,115 @@ internal static class NtfsNative
         }
     }
 
+    public static IReadOnlyList<FileExtent> GetFileExtentsByRetrievalPointers(string path)
+    {
+        const uint fsctlGetRetrievalPointers = 0x00090073;
+        const int errorMoreData = 234;
+        const int outputBufferSize = 64 * 1024;
+
+        var normalizedPath = path.StartsWith(@"\\?\", StringComparison.Ordinal) ? path : @"\\?\" + path;
+        var handle = CreateFileW(
+            normalizedPath,
+            FileReadAttributes,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            0,
+            IntPtr.Zero);
+
+        if (handle.IsInvalid)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), $"CreateFileW failed for '{path}'");
+        }
+
+        using (handle)
+        {
+            var extents = new List<FileExtent>();
+            var outBuffer = new byte[outputBufferSize];
+            long requestStartingVcn = 0;
+
+            while (true)
+            {
+                var input = new StartingVcnInputBuffer { StartingVcn = requestStartingVcn };
+                var inputSize = Marshal.SizeOf<StartingVcnInputBuffer>();
+                var inputPtr = Marshal.AllocHGlobal(inputSize);
+
+                try
+                {
+                    Marshal.StructureToPtr(input, inputPtr, false);
+
+                    var ok = DeviceIoControl(
+                        handle,
+                        fsctlGetRetrievalPointers,
+                        inputPtr,
+                        (uint)inputSize,
+                        outBuffer,
+                        (uint)outBuffer.Length,
+                        out var bytesReturned,
+                        IntPtr.Zero);
+
+                    var error = Marshal.GetLastWin32Error();
+                    if (!ok && error != errorMoreData)
+                    {
+                        throw new Win32Exception(error, $"DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS) failed for '{path}'");
+                    }
+
+                    if (bytesReturned < 16)
+                    {
+                        throw new InvalidOperationException("FSCTL_GET_RETRIEVAL_POINTERS returned too little data.");
+                    }
+
+                    var extentCount = BitConverter.ToUInt32(outBuffer, 0);
+                    var startingVcn = BitConverter.ToInt64(outBuffer, 8);
+                    var currentVcn = startingVcn;
+
+                    for (var i = 0; i < extentCount; i++)
+                    {
+                        var extentOffset = 16 + (i * 16);
+                        if ((uint)(extentOffset + 16) > bytesReturned)
+                        {
+                            throw new InvalidOperationException("Malformed retrieval pointer buffer.");
+                        }
+
+                        var nextVcn = BitConverter.ToInt64(outBuffer, extentOffset);
+                        var lcn = BitConverter.ToInt64(outBuffer, extentOffset + 8);
+                        var length = nextVcn - currentVcn;
+                        if (length <= 0)
+                        {
+                            throw new InvalidOperationException($"Invalid extent length ({length}) in retrieval pointers.");
+                        }
+
+                        extents.Add(new FileExtent(lcn, length));
+                        currentVcn = nextVcn;
+                    }
+
+                    if (ok)
+                    {
+                        break;
+                    }
+
+                    if (extentCount == 0)
+                    {
+                        throw new InvalidOperationException("FSCTL_GET_RETRIEVAL_POINTERS returned ERROR_MORE_DATA with zero extents.");
+                    }
+
+                    requestStartingVcn = currentVcn;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(inputPtr);
+                }
+            }
+
+            if (extents.Count == 0)
+            {
+                throw new InvalidOperationException("No extents returned by FSCTL_GET_RETRIEVAL_POINTERS.");
+            }
+
+            return extents;
+        }
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFileW(
         string lpFileName,
@@ -509,9 +662,28 @@ internal static class NtfsNative
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle hDevice,
+        uint dwIoControlCode,
+        IntPtr lpInBuffer,
+        uint nInBufferSize,
+        [Out] byte[] lpOutBuffer,
+        uint nOutBufferSize,
+        out uint lpBytesReturned,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandle(
         SafeFileHandle hFile,
         out ByHandleFileInformation lpFileInformation);
+
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StartingVcnInputBuffer
+    {
+        public long StartingVcn;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FileTime
