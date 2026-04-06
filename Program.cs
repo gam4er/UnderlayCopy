@@ -187,7 +187,12 @@ internal static class FsutilParser
             }
 
             var segments = rawLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            var clustersHex = segments.SkipWhile(s => !s.Equals("Clusters:", StringComparison.OrdinalIgnoreCase)).Skip(1).FirstOrDefault();
+            var clustersHex = segments.SkipWhile(s => 
+                !(
+                    s.Equals("Clusters:", StringComparison.OrdinalIgnoreCase) || 
+                    s.Equals("Кластеры:", StringComparison.OrdinalIgnoreCase)
+                )
+            ).Skip(1).FirstOrDefault();
             var lcnHex = segments.SkipWhile(s => !s.Equals("LCN:", StringComparison.OrdinalIgnoreCase)).Skip(1).FirstOrDefault();
 
             if (clustersHex is null || lcnHex is null)
@@ -251,7 +256,7 @@ internal static class NtfsReader
                 break;
             }
 
-            var len = BitConverter.ToInt32(record, attrOffset + 4);
+            ushort len = BitConverter.ToUInt16(record, attrOffset + 4);
             var nonResident = record[attrOffset + 8];
 
             if (type == 0x30)
@@ -327,7 +332,7 @@ internal static class NtfsReader
         }
         else if (info.FileSize > 0)
         {
-            var attrOffset = BitConverter.ToUInt16(record, 20);
+            ushort attrOffset = BitConverter.ToUInt16(record, 20);
             while (attrOffset < record.Length)
             {
                 var type = BitConverter.ToInt32(record, attrOffset);
@@ -340,7 +345,7 @@ internal static class NtfsReader
                     break;
                 }
 
-                var len = BitConverter.ToInt32(record, attrOffset + 4);
+                ushort len = BitConverter.ToUInt16(record, attrOffset + 4);
                 attrOffset += len;
             }
         }
