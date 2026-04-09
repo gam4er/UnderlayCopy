@@ -1,9 +1,10 @@
+using Microsoft.Win32.SafeHandles;
+
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
-using Microsoft.Win32.SafeHandles;
 
 if (!OperatingSystem.IsWindows())
 {
